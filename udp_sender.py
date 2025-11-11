@@ -30,7 +30,7 @@ from adxl355_sensor import ADXL355
 # ==============================
 
 # IP and port of the Linux PC that receives data
-DATA_TARGET_IP = "192.168.9.100"   # <-- adjust to your Ubuntu PC's IP if needed
+DATA_TARGET_IP = "192.168.9.100"   # <-- adjust to your PC's IP if needed
 DATA_TARGET_PORT = 5005
 
 # Control socket on the Raspberry Pi: listens for commands from the PC
