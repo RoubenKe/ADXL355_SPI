@@ -32,3 +32,27 @@ sudo apt install python3-pip python3-spidev -y
 git clone https://github.com/RoubenKe/ADXL355_SPI.git
 cd ADXL355_SPI
 pip install -r requirements.txt
+```
+
+## Usage
+
+Run the reader for testing:
+
+```bash
+python3 test_adxl355.py
+```
+
+This will:
+- initialize the ADXL355 over SPI,
+- set the range to ±4 g,
+- print raw values, values in g and in m/s² to the console.
+
+Start the UDP sender:
+
+```bash
+python3 udp_sender.py
+```
+
+By default, the sender:
+- streams raw acceleration data via UDP to 192.168.9.100:5005
+- listens for control commands on 0.0.0.0:5006
