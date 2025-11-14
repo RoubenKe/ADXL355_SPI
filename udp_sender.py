@@ -21,6 +21,7 @@ import json
 import socket
 import threading
 import time
+from collections import deque
 from typing import Tuple
 
 from adxl355_sensor import ADXL355
@@ -39,7 +40,11 @@ CTRL_LISTEN_PORT = 5006
 
 # Default sensor configuration
 DEFAULT_RANGE_G = 4         # ±4 g as default
-DEFAULT_SAMPLE_RATE_HZ = 200.0  # data messages per second
+DEFAULT_SAMPLE_RATE_HZ = 1000.0  # data messages per second (target: 1000 Hz)
+
+# Frequency monitoring
+FREQ_MONITOR_WINDOW = 100  # Calculate frequency over last N samples
+FREQ_PRINT_INTERVAL = 2.0  # Print frequency stats every N seconds
 
 # ==============================
 # Shared state
@@ -75,10 +80,16 @@ def send_json(sock: socket.socket, addr: Tuple[str, int], obj: dict) -> None:
 # ==============================
 
 def data_loop(sensor: ADXL355, data_sock: socket.socket) -> None:
-    """Continuously read sensor data and send via UDP."""
+    """Continuously read sensor data and send via UDP with precise timing."""
     global current_sample_rate_hz, current_range_g
 
     print("[INFO] Data thread started.")
+
+    # Frequency monitoring
+    timestamps = deque(maxlen=FREQ_MONITOR_WINDOW)
+    sample_count = 0
+    last_freq_print = time.perf_counter()
+    last_period_start = time.perf_counter()
 
     while not stop_event.is_set():
         # Copy config under lock
@@ -89,19 +100,23 @@ def data_loop(sensor: ADXL355, data_sock: socket.socket) -> None:
         if rate_hz <= 0:
             rate_hz = 10.0  # fallback
 
-        period = 1.0 / rate_hz
+        target_period = 1.0 / rate_hz  # Target period in seconds
 
         if streaming_enabled.is_set():
-            timestamp = time.time()
-
+            # Read sensor
             try:
                 x_raw, y_raw, z_raw = sensor.read_raw()
             except Exception as e:
                 print(f"[ERROR] Sensor read failed: {e}")
-                # avoid busy-loop on continuous errors
                 time.sleep(0.1)
                 continue
 
+            # Get timestamp
+            timestamp = time.time()
+            timestamps.append(timestamp)
+            sample_count += 1
+
+            # Build message (optimized: direct dict creation)
             msg = {
                 "type": "data",
                 "ts": timestamp,
@@ -111,10 +126,58 @@ def data_loop(sensor: ADXL355, data_sock: socket.socket) -> None:
                 "z_raw": z_raw,
             }
 
-            send_json(data_sock, (DATA_TARGET_IP, DATA_TARGET_PORT), msg)
+            # Send UDP (optimized: single encode)
+            try:
+                data = json.dumps(msg).encode("utf-8")
+                data_sock.sendto(data, (DATA_TARGET_IP, DATA_TARGET_PORT))
+            except Exception as e:
+                print(f"[WARN] UDP send failed: {e}")
 
-        # basic pacing – not hard real-time, but sufficient for streaming
-        time.sleep(period)
+            # Frequency monitoring and reporting
+            now = time.perf_counter()
+            if now - last_freq_print >= FREQ_PRINT_INTERVAL:
+                if len(timestamps) >= 2:
+                    time_span = timestamps[-1] - timestamps[0]
+                    actual_freq = (len(timestamps) - 1) / time_span if time_span > 0 else 0
+                    
+                    # Calculate min/max from intervals
+                    intervals = [timestamps[i] - timestamps[i-1] 
+                               for i in range(1, len(timestamps))]
+                    if intervals:
+                        min_period = min(intervals)
+                        max_period = max(intervals)
+                        min_freq = 1.0 / max_period if max_period > 0 else 0
+                        max_freq = 1.0 / min_period if min_period > 0 else 0
+                        
+                        print(f"[FREQ] Target: {rate_hz:.1f} Hz | "
+                              f"Actual: {actual_freq:.1f} Hz | "
+                              f"Range: {min_freq:.1f}-{max_freq:.1f} Hz | "
+                              f"Samples: {sample_count}")
+                    else:
+                        print(f"[FREQ] Target: {rate_hz:.1f} Hz | "
+                              f"Actual: {actual_freq:.1f} Hz | "
+                              f"Samples: {sample_count}")
+                
+                last_freq_print = now
+
+        # Precise timing: wait until next period
+        next_period_start = last_period_start + target_period
+        now = time.perf_counter()
+        
+        # Calculate sleep time (with small safety margin)
+        sleep_time = next_period_start - now
+        
+        if sleep_time > 0.001:  # Only sleep if more than 1ms
+            time.sleep(sleep_time)
+        elif sleep_time < -0.01:  # If we're more than 10ms behind, reset
+            # We're falling behind - reset timing
+            last_period_start = now
+        else:
+            # Very small delay or slightly ahead - busy wait for precision
+            while time.perf_counter() < next_period_start:
+                pass
+        
+        last_period_start = next_period_start
 
     print("[INFO] Data thread stopped.")
 
@@ -178,11 +241,11 @@ def handle_command(cmd: dict, sensor: ADXL355, ctrl_sock: socket.socket, addr: T
 
     elif command == "set_rate":
         hz = float(cmd.get("hz", 0.0))
-        if hz <= 0 or hz > 2000.0:
+        if hz <= 0 or hz > 4000.0:
             resp = {
                 "type": "resp",
                 "ok": False,
-                "error": "hz must be between 0 and 2000"
+                "error": "hz must be between 0 and 4000 (ADXL355 max rate)"
             }
             send_json(ctrl_sock, addr, resp)
             return
@@ -257,8 +320,9 @@ def main():
 
     print("[INFO] Starting ADXL355 UDP sender...")
 
-    # Initialize sensor
-    sensor = ADXL355(bus=0, device=0, max_speed_hz=1_000_000)
+    # Initialize sensor with higher SPI speed for 1000 Hz operation
+    # ADXL355 supports up to 10 MHz SPI clock, using 5 MHz for reliability
+    sensor = ADXL355(bus=0, device=0, max_speed_hz=5_000_000)
     sensor.set_range(DEFAULT_RANGE_G)
     with config_lock:
         current_range_g = DEFAULT_RANGE_G
